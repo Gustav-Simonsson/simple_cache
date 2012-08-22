@@ -1,38 +1,38 @@
 -module(simple_cache).
 -behaviour(gen_server).
 -define(SERVER, ?MODULE).
-
--record(state, {table, heap}).
+%% Expiration is in seconds, erlang:send_after/3 uses milliseconds.
+-define(EXPIRATION_UNIT, 1000).
+-record(state, {table}).
 
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
-
--export([start_link/0, set/2, set/3, lookup/1, lookup/2, delete/1]).
+-export([start_link/0, insert/2, insert/3, lookup/1, lookup/2, delete/1]).
 
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
 %% ------------------------------------------------------------------
-
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
 %% ------------------------------------------------------------------
-
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-set(Key, Value) ->
-    gen_server:cast(?SERVER,{set, Key, Value, infinity}).
+insert(Key, Value) ->
+    gen_server:cast(?SERVER,{insert, Key, Value, infinity}).
 
-set(Key, _Value, 0) -> delete(Key);
+insert(Key, _Value, 0) -> 
+    delete(Key);
 
-set(Key, Value, Expires) when is_number(Expires), Expires > 0 ->
-    gen_server:cast(?SERVER, {set, Key, Value, Expires}).
+insert(Key, Value, Expires) when is_number(Expires), Expires > 0 ->
+    gen_server:cast(?SERVER, {insert, Key, Value, Expires}).
 
-lookup(Key) -> get(?SERVER, Key).
+lookup(Key) -> 
+    get_key(?SERVER, Key).
 
 lookup(Key, Default) ->
     case lookup(Key) of
@@ -49,49 +49,38 @@ delete(Key) ->
 %% ------------------------------------------------------------------
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
-
 init(_Args) ->
-    State = #state{table=ets:new(?SERVER, [{read_concurrency, true}, named_table]), heap=pairheap:new()},
-    {ok, State}.
+    EtsTable = ets:new(?SERVER, [{read_concurrency, true}, named_table]),
+    {ok, #state{table = EtsTable}}.
 
-% Try to get the key.
 handle_call(_Request, _From, State) ->
-    {NewHeap, Timeout} = clean_expired(State),
-    {reply, ok, State#state{heap=NewHeap}, Timeout}.
+    {reply, ok, State}.
 
-% Sets a key without an expiration.
-handle_cast({set, Key, Value, infinity}, #state{table=Table, heap=Heap} = State) ->
-    ets:insert(Table, {Key, Value, infinity}),
-    {NewHeap, Timeout} = clean_expired(Table, Heap),
-    {noreply, State#state{heap=NewHeap}, Timeout};
-
-% Sets a key with an expiration.
-handle_cast({set, Key, Value, Expires}, #state{table=Table, heap=Heap} = State) ->
-    ExpireTime = current_time() + Expires,
-    ets:insert(Table, {Key, Value, ExpireTime}),
-    {NewHeap, Timeout} = clean_expired(Table, pairheap:insert(Heap, {Key, ExpireTime})),
-    {noreply, State#state{heap=NewHeap}, Timeout};
-
+% Inserts a key without an expiration.
+handle_cast({insert, Key, Value, infinity}, #state{table=Table} = State) ->
+    ets:insert(Table, {Key, Value}),
+    {noreply, State};
+% Inserts a key with an expiration.
+handle_cast({insert, Key, Value, ExpireTime}, #state{table=Table} = State) ->
+    ets:insert(Table, {Key, Value}),
+    erlang:send_after(?EXPIRATION_UNIT * ExpireTime, ?SERVER, {expired, Key}),
+    {noreply, State};
 % Delete a key from the cache.
 handle_cast({delete, Key}, #state{table=Table}=State) ->
     ets:delete(Table, Key),
-    {NewHeap, Timeout} = clean_expired(State),
-    {noreply, State#state{heap=NewHeap}, Timeout};
-
+    {noreply, State};
 handle_cast(_Msg, State) ->
-    {NewHeap, Timeout} = clean_expired(State),
-    {noreply, State#state{heap=NewHeap}, Timeout}.
+    {noreply, State}.
 
 % We've timed out, so a key has in all likelihood expired.
-handle_info(timeout, State) ->
-    {NewHeap, Timeout} = clean_expired(State),
-    {noreply, State#state{heap=NewHeap}, Timeout};
-
+handle_info({expired, Key}, #state{table=Table}=State) ->
+    ets:delete(Table, Key),    
+    {noreply, State};
 handle_info(_Info, State) ->
-    {NewHeap, Timeout} = clean_expired(State),
-    {noreply, State#state{heap=NewHeap}, Timeout}.
+    {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{table=Table}) ->
+    catch ets:delete(Table),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -100,46 +89,11 @@ code_change(_OldVsn, State, _Extra) ->
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
-current_time() ->
-    calendar:datetime_to_gregorian_seconds(erlang:localtime()).
-
-clean_expired(#state{table=T, heap=H}) ->
-    clean_expired(T, H).
-clean_expired(Table, Heap) ->
-    clean_expired(Table, Heap, current_time()).
-
-% Deletes expired keys
-clean_expired(Table, Heap, CurrentTime) ->
-    case pairheap:find_min(Heap) of
-        % When we have a key that looks expired.
-        {ok, {Key, Expires}} when Expires =< CurrentTime ->
-
-            % Grab the key
-            case ets:lookup(Table, Key) of
-                % We need to check that the Expiration date hasn't been updated
-                % to a later time.
-                [{Key, _Value, RealExpires}] when RealExpires =< CurrentTime ->
-                    ets:delete(Table, Key);
-
-                % Key is no longer in the table or hasn't expired, move along.
-                _Other -> ok
-            end,
-            {ok, NewHeap} = pairheap:delete_min(Heap),
-            clean_expired(Table, NewHeap);
-
-        % Non-expired key
-        {ok, {_Key, Expires}} ->
-            {Heap, Expires - CurrentTime};
-
-        % Empty Heap, never times out.
-        {error, empty} ->
-            {Heap, infinity}
-    end.
 
 % Retrieves an item from the cache.
-get(Table, Key) ->
+get_key(Table, Key) ->
      case ets:lookup(Table, Key) of
-        [{Key, Value, _Expires}] ->
+        [{Key, Value}] ->
             {ok, Value};
         [] ->
             {error, missing}
